@@ -1,0 +1,17 @@
+repos:
+  - repo: local
+    hooks:
+      - id: running-relevant-tests-commit
+        name: Run relevant tests (commit)
+        entry: python running-relevant-tests/scripts/run_relevant_tests.py --mode commit
+        language: python
+        types: [python]
+        pass_filenames: false
+        stages: [pre-commit]
+      - id: running-relevant-tests-push
+        name: Run relevant tests (push)
+        entry: python running-relevant-tests/scripts/run_relevant_tests.py --mode push
+        language: python
+        types: [python]
+        pass_filenames: false
+        stages: [pre-push]

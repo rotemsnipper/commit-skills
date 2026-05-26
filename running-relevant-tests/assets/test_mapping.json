@@ -1,0 +1,5 @@
+{
+  "_runner": "pytest",
+  "_src_root": "src/",
+  "_test_root": "tests/"
+}
