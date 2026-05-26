@@ -1,17 +1,31 @@
 #!/usr/bin/env python3
 import argparse
 import json
-import os
 import subprocess
 import sys
 from pathlib import Path
 
 
+def find_project_root():
+    current = Path.cwd()
+    for directory in [current] + list(current.parents):
+        if (directory / "test_mapping.json").exists():
+            return directory
+        if (directory / ".git").exists():
+            return directory
+    return current
+
+
 def load_config(project_root):
     mapping_path = project_root / "test_mapping.json"
     if not mapping_path.exists():
-        return {}, "pytest", "src/", "tests/"
-    data = json.loads(mapping_path.read_text(encoding="utf-8"))
+        print("Run install.py first — test_mapping.json not found.")
+        sys.exit(0)
+    try:
+        data = json.loads(mapping_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        print(f"Malformed test_mapping.json: {exc.msg} at line {exc.lineno}, col {exc.colno}")
+        sys.exit(1)
     runner = data.get("_runner", "pytest")
     src_root = data.get("_src_root", "src/").rstrip("/") + "/"
     test_root = data.get("_test_root", "tests/").rstrip("/") + "/"
@@ -19,45 +33,62 @@ def load_config(project_root):
     return mappings, runner, src_root, test_root
 
 
-def get_current_branch():
-    result = subprocess.run(
-        ["git", "symbolic-ref", "--short", "HEAD"],
-        capture_output=True, text=True,
-    )
-    if result.returncode != 0:
-        return None
-    return result.stdout.strip()
+def _run_git(args, cwd):
+    result = subprocess.run(["git"] + args, capture_output=True, text=True, cwd=str(cwd))
+    return result.returncode, result.stdout.strip()
 
 
-def get_changed_files(mode):
+def _parse_names(output):
+    files = []
+    for line in output.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        if "\t" in line:
+            line = line.split("\t")[-1]
+        elif " -> " in line:
+            line = line.split(" -> ")[-1]
+        if line.endswith(".py"):
+            files.append(line)
+    return files
+
+
+def get_changed_files(mode, project_root):
     if mode == "commit":
-        result = subprocess.run(
-            ["git", "diff", "--cached", "--name-only", "--diff-filter=ACMR"],
-            capture_output=True, text=True,
+        rc, out = _run_git(
+            ["diff", "--cached", "--name-only", "--diff-filter=ACMR"], project_root
         )
-        return [f for f in result.stdout.splitlines() if f]
+        if rc != 0:
+            return []
+        return _parse_names(out)
 
-    branch = get_current_branch()
-    if branch is None:
-        print("ERROR: detached HEAD — cannot determine push range", file=sys.stderr)
+    rc, branch = _run_git(["rev-parse", "--abbrev-ref", "HEAD"], project_root)
+    if rc != 0 or branch == "HEAD":
+        print("Detached HEAD — cannot determine push range. Skipping tests.")
         sys.exit(0)
 
-    result = subprocess.run(
-        ["git", "diff", f"origin/{branch}...HEAD", "--name-only", "--diff-filter=ACMR"],
-        capture_output=True, text=True,
-    )
-    if result.returncode == 0:
-        return [f for f in result.stdout.splitlines() if f]
-
-    for fallback in ("main", "master"):
-        result = subprocess.run(
-            ["git", "diff", f"{fallback}...HEAD", "--name-only", "--diff-filter=ACMR"],
-            capture_output=True, text=True,
+    for ref in (f"origin/{branch}", "origin/main", "origin/master"):
+        rc, out = _run_git(
+            ["diff", f"{ref}...HEAD", "--name-only", "--diff-filter=ACMR"], project_root
         )
-        if result.returncode == 0:
-            return [f for f in result.stdout.splitlines() if f]
+        if rc == 0:
+            return _parse_names(out)
 
-    return []
+    print("Could not determine push range — no reachable remote ref found. Skipping tests.")
+    sys.exit(0)
+
+
+FOUND = "FOUND"
+INTENTIONAL = "INTENTIONAL"
+UNMAPPED = "UNMAPPED"
+FULL_SUITE = "FULL_SUITE"
+
+
+def _mirror(f, src_root, test_root):
+    rel = f[len(src_root):] if f.startswith(src_root) else f
+    parts = rel.replace("\\", "/").split("/")
+    parts[-1] = "test_" + parts[-1]
+    return test_root + "/".join(parts)
 
 
 def find_related_tests(files, mappings, src_root, test_root, project_root):
@@ -65,148 +96,97 @@ def find_related_tests(files, mappings, src_root, test_root, project_root):
     full_suite = False
 
     for f in files:
-        if not f.endswith(".py"):
-            continue
-
         if Path(f).name == "conftest.py":
             full_suite = True
+            results.append((f, FULL_SUITE, None))
             continue
 
         if f in mappings:
             mapped = mappings[f]
-            if mapped == [] or mapped == "":
-                results.append((f, "INTENTIONAL", None))
+            if isinstance(mapped, list) and len(mapped) == 0:
+                results.append((f, INTENTIONAL, None))
             elif isinstance(mapped, list):
                 for t in mapped:
-                    results.append((f, "FOUND", t))
+                    results.append((f, FOUND, t))
+            elif isinstance(mapped, str) and mapped:
+                results.append((f, FOUND, mapped))
             else:
-                results.append((f, "FOUND", mapped))
+                results.append((f, UNMAPPED, None))
             continue
 
-        if f.startswith(src_root):
-            relative = f[len(src_root):]
-            parts = Path(relative)
-            mirrored = test_root + str(parts.parent / ("test_" + parts.name)).replace("\\", "/")
-            if (project_root / mirrored).exists():
-                results.append((f, "FOUND", mirrored))
-                continue
+        mirror = _mirror(f, src_root, test_root)
+        if (project_root / mirror).exists():
+            results.append((f, FOUND, mirror))
+            continue
 
-        results.append((f, "UNMAPPED", None))
+        results.append((f, UNMAPPED, None))
 
     return results, full_suite
 
 
 def print_summary(results):
-    found = [(f, t) for f, s, t in results if s == "FOUND"]
-    unmapped = [f for f, s, t in results if s == "UNMAPPED"]
-    intentional = [f for f, s, t in results if s == "INTENTIONAL"]
-
-    col1 = max((len(f) for f, _, _ in results), default=30)
-    col1 = max(col1, 30)
-
-    header = f"{'File':<{col1}}  {'Status':<10}  Test file"
-    print(header)
-    print("-" * len(header))
-
+    divider = "─" * 46
+    print()
+    print("running-relevant-tests")
+    print(divider)
     for f, status, test in results:
-        if status == "FOUND":
-            print(f"{f:<{col1}}  {'✔ FOUND':<10}  {test}")
-        elif status == "UNMAPPED":
-            print(f"{f:<{col1}}  {'✘ UNMAPPED':<10}  —")
-        elif status == "INTENTIONAL":
-            print(f"{f:<{col1}}  {'✔ INTENT.':<10}  (intentionally untested)")
-
+        if status == FOUND:
+            print(f"  ✔ {f:<38} → {test}")
+        elif status == UNMAPPED:
+            print(f"  ✘ {f:<38} → UNMAPPED")
+        elif status == INTENTIONAL:
+            print(f"  ✔ {f:<38} → (intentionally untested)")
+        elif status == FULL_SUITE:
+            print(f"  ✔ {f:<38} → FULL SUITE")
+    print(divider)
+    mapped = sum(1 for _, s, _ in results if s == FOUND)
+    unmapped = sum(1 for _, s, _ in results if s == UNMAPPED)
+    print(f"  {mapped} mapped | {unmapped} unmapped")
     print()
-    print(f"Mapped: {len(found)}  |  Unmapped: {len(unmapped)}  |  Intentional: {len(intentional)}")
-    print()
 
+
+def print_unmapped_warnings(results, src_root, test_root):
     for f, status, _ in results:
-        if status != "UNMAPPED":
+        if status != UNMAPPED:
             continue
-        src_root_guess = "src/"
-        test_root_guess = "tests/"
-        relative = f[len(src_root_guess):] if f.startswith(src_root_guess) else f
-        parts = Path(relative)
-        mirror = test_root_guess + str(parts.parent / ("test_" + parts.name)).replace("\\", "/")
-        print(f"⚠ No test found for: {f}")
-        print(f"  Resolve by choosing one:")
-        print(f"  a) Create the mirrored test file: {mirror}")
-        print(f'  b) Add an explicit entry to test_mapping.json:')
-        print(f'       "{f}": "{mirror}"')
-        print(f'  c) Acknowledge as intentionally untested:')
+        mirror = _mirror(f, src_root, test_root)
+        print(f"WARNING: {f} has no mapped tests.")
+        print("  To fix, either:")
+        print(f"    a) Create {mirror}")
+        print( "    b) Add to test_mapping.json:")
+        print(f'       "{f}": ["tests/path/test_file.py"]')
+        print( "    c) To silence permanently:")
         print(f'       "{f}": []')
         print()
 
-    return found, unmapped
-
-
-def path_to_module(path):
-    return path.replace("/", ".").replace("\\", ".").removesuffix(".py")
-
-
-def run_tests(test_files, runner, mode, full_suite):
-    if full_suite:
-        if runner == "pytest":
-            cmd = ["pytest", "--tb=short", "-q"]
-        elif runner == "django":
-            cmd = ["python", "manage.py", "test"]
-        else:
-            cmd = ["python", "-m", "unittest", "discover"]
-        print(f"conftest.py changed — running full suite: {' '.join(cmd)}")
-        result = subprocess.run(cmd)
-        sys.exit(result.returncode)
-
-    if not test_files:
-        print("No tests to run.")
-        sys.exit(0)
-
-    unique_tests = sorted(set(test_files))
-
-    if runner == "pytest":
-        base = ["pytest"] + unique_tests + ["--tb=short", "-q"]
-        if mode == "commit":
-            base.insert(1, "-x")
-        cmd = base
-    elif runner == "django":
-        labels = [path_to_module(t) for t in unique_tests]
-        cmd = ["python", "manage.py", "test"] + labels
-        if mode == "commit":
-            cmd.append("--failfast")
-    else:
-        modules = [path_to_module(t) for t in unique_tests]
-        cmd = ["python", "-m", "unittest"] + modules
-        if mode == "commit":
-            cmd.append("--failfast")
-
-    print(f"Running: {' '.join(cmd)}")
-    result = subprocess.run(cmd)
-    sys.exit(result.returncode)
-
 
 def main():
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(prog="run_relevant_tests.py")
     parser.add_argument("--mode", choices=["commit", "push"], required=True)
     args = parser.parse_args()
 
-    project_root = Path.cwd()
+    project_root = find_project_root()
     mappings, runner, src_root, test_root = load_config(project_root)
 
-    changed = get_changed_files(args.mode)
+    changed = get_changed_files(args.mode, project_root)
     if not changed:
-        print("No relevant Python files changed.")
+        print("No Python files changed.")
         sys.exit(0)
 
     results, full_suite = find_related_tests(changed, mappings, src_root, test_root, project_root)
 
-    py_results = [r for r in results]
-    if not py_results and not full_suite:
+    if not results and not full_suite:
         print("No Python files in changed set.")
         sys.exit(0)
 
-    found_pairs, _ = print_summary(py_results)
-    test_files = [t for _, t in found_pairs]
+    print_summary(results)
+    print_unmapped_warnings(results, src_root, test_root)
 
-    run_tests(test_files, runner, args.mode, full_suite)
+    test_files = [t for _, s, t in results if s == FOUND]
+
+    if not test_files and not full_suite:
+        print("No tests to run.")
+        sys.exit(0)
 
 
 if __name__ == "__main__":
