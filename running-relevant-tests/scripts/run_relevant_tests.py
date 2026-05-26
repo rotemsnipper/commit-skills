@@ -129,8 +129,12 @@ def print_summary(results):
     print()
     print("running-relevant-tests")
     print(divider)
+    seen_tests = set()
     for f, status, test in results:
         if status == FOUND:
+            if test in seen_tests:
+                continue
+            seen_tests.add(test)
             print(f"  ✔ {f:<38} → {test}")
         elif status == UNMAPPED:
             print(f"  ✘ {f:<38} → UNMAPPED")
@@ -139,7 +143,7 @@ def print_summary(results):
         elif status == FULL_SUITE:
             print(f"  ✔ {f:<38} → FULL SUITE")
     print(divider)
-    mapped = sum(1 for _, s, _ in results if s == FOUND)
+    mapped = len(seen_tests)
     unmapped = sum(1 for _, s, _ in results if s == UNMAPPED)
     print(f"  {mapped} mapped | {unmapped} unmapped")
     print()
@@ -178,7 +182,7 @@ def run_tests(test_files, runner, mode, full_suite, project_root):
         print(f"Running full suite: {' '.join(cmd)}")
         sys.exit(subprocess.run(cmd, cwd=str(project_root)).returncode)
 
-    unique = sorted(set(test_files))
+    unique = test_files
 
     if runner == "pytest":
         flags = ["-x", "--tb=short", "-q"] if mode == "commit" else ["--tb=short", "-q"]
@@ -220,7 +224,7 @@ def main():
     print_summary(results)
     print_unmapped_warnings(results, src_root, test_root)
 
-    test_files = [t for _, s, t in results if s == FOUND]
+    test_files = sorted(set(t for _, s, t in results if s == FOUND))
 
     if not test_files and not full_suite:
         print("No tests to run.")
