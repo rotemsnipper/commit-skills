@@ -160,6 +160,44 @@ def print_unmapped_warnings(results, src_root, test_root):
         print()
 
 
+def path_to_module(path):
+    p = path.replace("/", ".").replace("\\", ".")
+    if p.endswith(".py"):
+        p = p[:-3]
+    return p
+
+
+def run_tests(test_files, runner, mode, full_suite, project_root):
+    if full_suite:
+        if runner == "pytest":
+            cmd = ["pytest", "--tb=short", "-q"]
+        elif runner == "django":
+            cmd = [sys.executable, "manage.py", "test"]
+        else:
+            cmd = [sys.executable, "-m", "unittest", "discover"]
+        print(f"Running full suite: {' '.join(cmd)}")
+        sys.exit(subprocess.run(cmd, cwd=str(project_root)).returncode)
+
+    unique = sorted(set(test_files))
+
+    if runner == "pytest":
+        flags = ["-x", "--tb=short", "-q"] if mode == "commit" else ["--tb=short", "-q"]
+        cmd = ["pytest"] + unique + flags
+    elif runner == "django":
+        labels = [path_to_module(t) for t in unique]
+        cmd = [sys.executable, "manage.py", "test"] + labels
+        if mode == "commit":
+            cmd.append("--failfast")
+    else:
+        modules = [path_to_module(t) for t in unique]
+        cmd = [sys.executable, "-m", "unittest"] + modules
+        if mode == "commit":
+            cmd.append("-f")
+
+    print(f"Running: {' '.join(cmd)}")
+    sys.exit(subprocess.run(cmd, cwd=str(project_root)).returncode)
+
+
 def main():
     parser = argparse.ArgumentParser(prog="run_relevant_tests.py")
     parser.add_argument("--mode", choices=["commit", "push"], required=True)
@@ -187,6 +225,8 @@ def main():
     if not test_files and not full_suite:
         print("No tests to run.")
         sys.exit(0)
+
+    run_tests(test_files, runner, args.mode, full_suite, project_root)
 
 
 if __name__ == "__main__":
